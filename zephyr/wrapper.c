@@ -25,6 +25,7 @@
 #include <device.h>
 #include <soc.h>
 #include <kernel.h>
+#include <version.h>
 
 #if !CONFIG_KERNEL_COHERENCE
 #include <arch/xtensa/cache.h>
@@ -539,6 +540,8 @@ void sys_comp_basefw_init(void);
 void sys_comp_copier_init(void);
 void sys_comp_codec_cadence_interface_init(void);
 void sys_comp_codec_passthrough_interface_init(void);
+void sys_comp_gain_init(void);
+void sys_comp_mixin_init(void);
 
 /* Zephyr redefines log_message() and mtrace_printf() which leaves
  * totally empty the .static_log_entries ELF sections for the
@@ -576,10 +579,16 @@ int task_main_start(struct sof *sof)
 
 	if (IS_ENABLED(CONFIG_COMP_VOLUME)) {
 		sys_comp_volume_init();
+
+		if (IS_ENABLED(CONFIG_IPC_MAJOR_4))
+			sys_comp_gain_init();
 	}
 
 	if (IS_ENABLED(CONFIG_COMP_MIXER)) {
 		sys_comp_mixer_init();
+
+		if (IS_ENABLED(CONFIG_IPC_MAJOR_4))
+			sys_comp_mixin_init();
 	}
 
 	if (IS_ENABLED(CONFIG_COMP_DAI)) {
@@ -718,6 +727,7 @@ void platform_dai_wallclock(struct comp_dev *dai, uint64_t *wallclock)
  */
 #if CONFIG_MULTICORE && CONFIG_SMP
 static atomic_t start_flag;
+static atomic_t ready_flag;
 
 /* Zephyr kernel_internal.h interface */
 void smp_timer_init(void);
@@ -732,6 +742,7 @@ static FUNC_NORETURN void secondary_init(void *arg)
 	 * secondary_core_init() for each core.
 	 */
 
+	atomic_set(&ready_flag, 1);
 	z_smp_thread_init(arg, &dummy_thread);
 	smp_timer_init();
 
@@ -763,9 +774,22 @@ int z_wrapper_cpu_enable_secondary_core(int id)
 	 * secondary_init() for SOF.
 	 */
 
+	if (arch_cpu_active(id))
+		return 0;
+
+#if ZEPHYR_VERSION(3, 0, 99) <= ZEPHYR_VERSION_CODE
+	z_init_cpu(id);
+#endif
+
 	atomic_clear(&start_flag);
+	atomic_clear(&ready_flag);
+
 	arch_start_cpu(id, z_interrupt_stacks[id], CONFIG_ISR_STACK_SIZE,
 		       secondary_init, &start_flag);
+
+	while (!atomic_get(&ready_flag))
+		k_busy_wait(100);
+
 	atomic_set(&start_flag, 1);
 
 	return 0;

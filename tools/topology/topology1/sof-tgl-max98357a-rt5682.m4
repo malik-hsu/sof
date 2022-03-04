@@ -140,7 +140,11 @@ ifdef(`GOOGLE_RTC_AUDIO_PROCESSING', `define(`SPK_PLAYBACK_CORE', DMIC_PIPELINE_
 define(KWD_PIPE_SCH_DEADLINE_US, 5000)
 
 # include the generic dmic with kwd
-include(`platform/intel/intel-generic-dmic-kwd.m4')
+ifdef(`NOHOTWORD',
+`
+define(NO16KDMIC)
+include(`platform/intel/intel-generic-dmic.m4')',
+`include(`platform/intel/intel-generic-dmic-kwd.m4')')
 
 ifdef(`BT_OFFLOAD', `
 # BT offload support
@@ -247,8 +251,13 @@ DAI_ADD(sof/pipe-dai-capture.m4,
 ',
 `
 ifdef(`2CH_2WAY',`# No echo reference for 2-way speakers',
-`# currently this dai is here as "virtual" capture backend
-W_DAI_IN(SSP, SPK_SSP_INDEX, SPK_SSP_NAME, FMT, 3, 0)
+`
+# The echo refenrence pipeline has no connections in it,
+# it is used for the capture DAI widget to dock.
+DAI_ADD(sof/pipe-echo-ref-dai-capture.m4,
+	29, SSP, SPK_SSP_INDEX, SPK_SSP_NAME,
+	PIPELINE_SINK_29, 3, FMT,
+	SPK_MIC_PERIOD_US, 0, SPK_PLAYBACK_CORE, SCHEDULE_TIME_DOMAIN_TIMER)
 
 `# Capture pipeline 9 from demux on PCM 6 using max 'ifdef(`4CH_PASSTHROUGH', `4', `2')` channels of s32le.'
 PIPELINE_PCM_ADD(sof/pipe-passthrough-capture-sched.m4,

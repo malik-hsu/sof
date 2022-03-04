@@ -25,17 +25,9 @@ PREPROCESS_PLUGINS=nhlt,NHLT_BIN=nhlt.bin"
 
 # CAVS SDW topology with passthrough pipelines
 "cavs-sdw\;cavs-sdw"
-# CAVS SSP topology with passthrough pipelines, default SSP MCLK is 38.4MHz
-"cavs-nocodec\;cavs-adl-nocodec"
-"cavs-nocodec\;cavs-ehl-nocodec"
-"cavs-nocodec\;cavs-tgl-nocodec"
-"cavs-nocodec\;cavs-tgl-h-nocodec"
-"cavs-nocodec\;cavs-jsl-nocodec"
-"cavs-nocodec\;cavs-icl-nocodec"
-"cavs-nocodec\;cavs-cml-nocodec\;MCLK=24000000"
-"cavs-nocodec\;cavs-cnl-nocodec\;MCLK=24000000"
-"cavs-nocodec\;cavs-glk-nocodec\;MCLK=19200000"
-"cavs-nocodec\;cavs-apl-nocodec\;MCLK=19200000"
+# CAVS SSP topology for TGL
+"cavs-nocodec\;cavs-tgl-nocodec\;NUM_DMICS=2,\
+PREPROCESS_PLUGINS=nhlt,NHLT_BIN=nhlt-cavs-tgl-nocodec.bin"
 )
 
 # This will override the topology1 binaries with topology2 binaries

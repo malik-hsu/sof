@@ -60,19 +60,20 @@ static int dts_effect_convert_sof_interface_result(struct comp_dev *dev,
 static int dts_effect_populate_buffer_configuration(struct comp_dev *dev,
 	DtsSofInterfaceBufferConfiguration *buffer_config)
 {
+	struct comp_buffer *source = list_first_item(&dev->bsource_list, struct comp_buffer,
+						     sink_list);
 	struct processing_module *mod = comp_get_drvdata(dev);
 	const struct audio_stream *stream;
 	DtsSofInterfaceBufferLayout buffer_layout;
 	DtsSofInterfaceBufferFormat buffer_format;
-
 	comp_dbg(dev, "dts_effect_populate_buffer_configuration() start");
 
-	if (!mod->ca_source)
+	if (!source)
 		return -EINVAL;
 
-	stream = &mod->ca_source->stream;
+	stream = &source->stream;
 
-	switch (mod->ca_source->buffer_fmt) {
+	switch (source->buffer_fmt) {
 	case SOF_IPC_BUFFER_INTERLEAVED:
 		buffer_layout = DTS_SOF_INTERFACE_BUFFER_LAYOUT_INTERLEAVED;
 		break;
@@ -216,9 +217,13 @@ static int dts_codec_init_process(struct comp_dev *dev)
 	return ret;
 }
 
-static int dts_codec_process(struct comp_dev *dev)
+static int
+dts_codec_process(struct processing_module *mod,
+		  struct input_stream_buffer *input_buffers, int num_input_buffers,
+		  struct output_stream_buffer *output_buffers, int num_output_buffers)
 {
 	int ret;
+	struct comp_dev *dev = mod->dev;
 	struct module_data *codec = comp_get_module_data(dev);
 	DtsSofInterfaceResult dts_result;
 	unsigned int bytes_processed = 0;

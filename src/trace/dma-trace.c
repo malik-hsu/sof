@@ -28,6 +28,10 @@
 #include <user/abi_dbg.h>
 #include <sof_versions.h>
 
+#ifdef __ZEPHYR__
+#include <version.h>
+#endif
+
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -491,8 +495,6 @@ out:
 
 void dma_trace_disable(struct dma_trace_data *d)
 {
-	struct dma_trace_buf *buffer = &d->dmatb;
-
 	/* cancel trace work */
 	schedule_task_cancel(&d->dmat_work);
 
@@ -509,14 +511,6 @@ void dma_trace_disable(struct dma_trace_data *d)
 		d->host_size = 0;
 	}
 #endif
-
-	/*
-	 * Reset the local read and write pointers to preserve the captured logs
-	 * while the dtrace is disabed
-	 */
-	buffer->w_ptr = buffer->addr;
-	buffer->r_ptr = buffer->addr;
-	buffer->avail = 0;
 }
 
 /** Sends all pending DMA messages to mailbox (for emergencies) */

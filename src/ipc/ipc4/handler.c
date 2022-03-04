@@ -177,6 +177,23 @@ static int propagate_state_to_ppl_comp(struct ipc *ipc, uint32_t ppl_id, int cmd
 	return ret;
 }
 
+static bool is_any_ppl_active(void)
+{
+	struct ipc_comp_dev *icd;
+	struct list_item *clist;
+
+	list_for_item(clist, &ipc_get()->comp_list) {
+		icd = container_of(clist, struct ipc_comp_dev, list);
+		if (icd->type != COMP_TYPE_PIPELINE)
+			continue;
+
+		if (icd->pipeline->status == COMP_STATE_ACTIVE)
+			return true;
+	}
+
+	return false;
+}
+
 /* Ipc4 pipeline message <------> ipc3 pipeline message
  * RUNNING     <-------> TRIGGER START
  * INIT + PAUSED  <-------> PIPELINE COMPLETE
@@ -738,27 +755,77 @@ static int ipc4_module_process_d0ix(union ipc4_message_header *ipc4)
 	return 0;
 }
 
-/* power up core 0 */
+/* enable/disable cores according to the state mask */
 static int ipc4_module_process_dx(union ipc4_message_header *ipc4)
 {
 	struct ipc4_module_set_dx dx;
+	struct ipc4_dx_state_info dx_info;
 	uint32_t module_id, instance_id;
+	uint32_t core_id;
+	int ret;
 
 	memcpy_s(&dx, sizeof(dx), ipc4, sizeof(dx));
 	module_id = dx.header.r.module_id;
 	instance_id = dx.header.r.instance_id;
 
-	tr_dbg(&ipc_tr, "ipc4_module_process_d0ix %x : %x", module_id, instance_id);
-
 	/* only module 0 can be used to set dx state */
-	if (dx.header.r.module_id || dx.header.r.instance_id) {
+	if (module_id || instance_id) {
 		tr_err(&ipc_tr, "invalid resource id %x : %x", module_id, instance_id);
 		return IPC4_INVALID_RESOURCE_ID;
 	}
 
-	/* nothing to do since core 0 is active now */
+	dcache_invalidate_region((void *)(MAILBOX_HOSTBOX_BASE), sizeof(dx_info));
+	memcpy_s(&dx_info, sizeof(dx_info), (const void *)MAILBOX_HOSTBOX_BASE, sizeof(dx_info));
 
-	return 0;
+	/* check if core enable mask is valid */
+	if (dx_info.core_mask > MASK(CONFIG_CORE_COUNT - 1, 0)) {
+		tr_err(&ipc_tr, "ipc4_module_process_dx: CONFIG_CORE_COUNT: %d < core enable mask: %d",
+		       CONFIG_CORE_COUNT, dx_info.core_mask);
+		return IPC4_ERROR_INVALID_PARAM;
+	}
+
+	/* check primary core first */
+	if ((dx_info.core_mask & BIT(PLATFORM_PRIMARY_CORE_ID)) &&
+	    (dx_info.dx_mask & BIT(PLATFORM_PRIMARY_CORE_ID))) {
+		/* core0 can't be activated more, it's already active since we got here */
+		tr_err(&ipc_tr, "Core0 is already active");
+		return IPC4_BAD_STATE;
+	}
+
+	/* Activate/deactivate requested cores */
+	for (core_id = 1; core_id < CONFIG_CORE_COUNT; core_id++) {
+		if ((dx_info.core_mask & BIT(core_id)) == 0)
+			continue;
+
+		if (dx_info.dx_mask & BIT(core_id)) {
+			ret = cpu_enable_core(core_id);
+			if (ret != 0) {
+				tr_err(&ipc_tr, "failed to enable core %d", core_id);
+				return IPC4_FAILURE;
+			}
+		} else {
+			cpu_disable_core(core_id);
+		}
+	}
+
+	/* Deactivating primary core if requested.  */
+	if (dx_info.core_mask & BIT(PLATFORM_PRIMARY_CORE_ID)) {
+		if (cpu_enabled_cores() & ~BIT(PLATFORM_PRIMARY_CORE_ID)) {
+			tr_err(&ipc_tr, "secondary cores 0x%x still active",
+			       cpu_enabled_cores());
+			return IPC4_BUSY;
+		}
+
+		if (is_any_ppl_active()) {
+			tr_err(&ipc_tr, "some pipelines are still active");
+			return IPC4_BUSY;
+		}
+
+		ipc_get()->pm_prepare_D3 = 1;
+		/* TODO: prepare for D3 */
+	}
+
+	return IPC4_SUCCESS;
 }
 
 static int ipc4_process_module_message(union ipc4_message_header *ipc4)

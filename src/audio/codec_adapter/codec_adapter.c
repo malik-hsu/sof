@@ -108,24 +108,11 @@ int codec_adapter_prepare(struct comp_dev *dev)
 	int ret;
 	struct processing_module *mod = comp_get_drvdata(dev);
 	struct module_data *md = &mod->priv;
+	struct list_item *blist;
 	uint32_t buff_periods;
 	uint32_t buff_size; /* size of local buffer */
 
 	comp_dbg(dev, "codec_adapter_prepare() start");
-
-	/* Init sink & source buffers */
-	mod->ca_sink = list_first_item(&dev->bsink_list, struct comp_buffer, source_list);
-	mod->ca_source = list_first_item(&dev->bsource_list, struct comp_buffer, sink_list);
-
-	if (!mod->ca_source) {
-		comp_err(dev, "codec_adapter_prepare(): source buffer not found");
-		return -EINVAL;
-	}
-
-	if (!mod->ca_sink) {
-		comp_err(dev, "codec_adapter_prepare(): sink buffer not found");
-		return -EINVAL;
-	}
 
 	/* Are we already prepared? */
 	ret = comp_set_state(dev, COMP_TRIGGER_PREPARE);
@@ -192,6 +179,19 @@ int codec_adapter_prepare(struct comp_dev *dev)
 	 */
 	buff_size = MAX(mod->period_bytes, md->mpd.out_buff_size) * buff_periods;
 
+	/* compute number of input buffers */
+	list_for_item(blist, &dev->bsource_list)
+		mod->num_input_buffers++;
+
+	/* compute number of output buffers */
+	list_for_item(blist, &dev->bsink_list)
+		mod->num_output_buffers++;
+
+	if (!mod->num_input_buffers || !mod->num_output_buffers) {
+		comp_err(dev, "codec_adapter_prepare(): invalid number of source/sink buffers");
+		return -EINVAL;
+	}
+
 	/* Allocate local buffer */
 	if (mod->local_buff) {
 		ret = buffer_set_size(mod->local_buff, buff_size);
@@ -238,50 +238,58 @@ int codec_adapter_params(struct comp_dev *dev,
 	return 0;
 }
 
+/**
+ * Function to copy from source buffer to the module buffer
+ * @source: source audio buffer stream
+ * @buff: pointer to the module input buffer
+ * @buff_size: size of the module input buffer
+ * @bytes: number of bytes available in the source buffer
+ */
 static void
-codec_adapter_copy_from_source_to_lib(const struct audio_stream *source,
-				      const struct module_processing_data *mpd,
-				      size_t bytes)
+ca_copy_from_source_to_module(const struct audio_stream *source, void *buff, uint32_t buff_size,
+			      size_t bytes)
 {
-	/* head_size - available data until end of local buffer */
+	/* head_size - available data until end of source buffer */
 	const int without_wrap = audio_stream_bytes_without_wrap(source, source->r_ptr);
 	uint32_t head_size = MIN(bytes, without_wrap);
-	/* tail_size - residue data to be copied starting from the beginning
-	 * of the buffer
-	 */
+	/* tail_size - residual data to be copied starting from the beginning of the buffer */
 	uint32_t tail_size = bytes - head_size;
-	/* copy head_size to lib buffer */
-	memcpy_s(mpd->in_buff, mpd->in_buff_size, source->r_ptr, head_size);
+
+	/* copy head_size to module buffer */
+	memcpy_s(buff, buff_size, source->r_ptr, head_size);
+
+	/* copy residual samples after wrap */
 	if (tail_size)
-	/* copy reset of the samples after wrap-up */
-		memcpy_s((char *)mpd->in_buff + head_size, mpd->in_buff_size,
+		memcpy_s((char *)buff + head_size, buff_size,
 			 audio_stream_wrap(source,
 					   (char *)source->r_ptr + head_size),
 					   tail_size);
 }
 
+/**
+ * Function to copy processed samples from the module buffer to sink buffer
+ * @sink: sink audio buffer stream
+ * @buff: pointer to the module output buffer
+ * @bytes: number of bytes available in the module output buffer
+ */
 static void
-codec_adapter_copy_from_lib_to_sink(const struct module_processing_data *mpd,
-				    const struct audio_stream *sink,
-				    size_t bytes)
+ca_copy_from_module_to_sink(const struct audio_stream *sink, void *buff, size_t bytes)
 {
-	/* head_size - free space until end of local buffer */
-	const int without_wrap =
-		audio_stream_bytes_without_wrap(sink, sink->w_ptr);
+	/* head_size - free space until end of sink buffer */
+	const int without_wrap = audio_stream_bytes_without_wrap(sink, sink->w_ptr);
 	uint32_t head_size = MIN(bytes, without_wrap);
 	/* tail_size - rest of the bytes that needs to be written
 	 * starting from the beginning of the buffer
 	 */
 	uint32_t tail_size = bytes - head_size;
 
-	/* copy head_size to sink buffer */
-	memcpy_s(sink->w_ptr, sink->size, mpd->out_buff, head_size);
+	/* copy "head_size" samples to sink buffer */
+	memcpy_s(sink->w_ptr, sink->size, buff, head_size);
+
+	/* copy rest of the samples after buffer wrap */
 	if (tail_size)
-	/* copy reset of the samples after wrap-up */
-		memcpy_s(audio_stream_wrap(sink,
-					   (char *)sink->w_ptr + head_size),
-			 sink->size,
-			 (char *)mpd->out_buff + head_size, tail_size);
+		memcpy_s(audio_stream_wrap(sink, (char *)sink->w_ptr + head_size),
+			 sink->size, (char *)buff + head_size, tail_size);
 }
 
 /**
@@ -311,19 +319,83 @@ int codec_adapter_copy(struct comp_dev *dev)
 {
 	int ret = 0;
 	uint32_t bytes_to_process, copy_bytes, processed = 0, produced = 0;
+	struct comp_buffer *source = list_first_item(&dev->bsource_list, struct comp_buffer,
+						     sink_list);
+	struct comp_buffer *sink = list_first_item(&dev->bsink_list, struct comp_buffer,
+						    source_list);
 	struct processing_module *mod = comp_get_drvdata(dev);
 	struct module_data *md = &mod->priv;
-	struct comp_buffer *source = mod->ca_source;
-	struct comp_buffer *sink = mod->ca_sink;
 	uint32_t codec_buff_size = md->mpd.in_buff_size;
 	struct comp_buffer *local_buff = mod->local_buff;
 	struct comp_copy_limits cl;
+	struct input_stream_buffer *input_buffers;
+	struct output_stream_buffer *output_buffers;
+	struct list_item *blist;
+	int i = 0;
+
+	if (!source || !sink) {
+		comp_err(dev, "codec_adapter_copy(): source/sink buffer not found");
+		return -EINVAL;
+	}
 
 	comp_get_copy_limits_with_lock(source, local_buff, &cl);
 	bytes_to_process = cl.frames * cl.source_frame_bytes;
 
 	comp_dbg(dev, "codec_adapter_copy() start: codec_buff_size: %d, local_buff free: %d source avail %d",
 		 codec_buff_size, local_buff->stream.free, source->stream.avail);
+
+	/* allocate memory for input buffers */
+	input_buffers = rzalloc(SOF_MEM_ZONE_RUNTIME, 0, SOF_MEM_CAPS_RAM,
+				sizeof(*input_buffers) * mod->num_input_buffers);
+	if (!input_buffers) {
+		comp_err(dev, "codec_adapter_copy(): failed to allocate input buffers");
+		return -ENOMEM;
+	}
+
+	/* allocate memory for input buffer data and copy source samples */
+	list_for_item(blist, &dev->bsource_list) {
+		int frames, source_frame_bytes;
+
+		source = container_of(blist, struct comp_buffer, sink_list);
+
+		source = buffer_acquire(source);
+		frames = audio_stream_avail_frames(&source->stream, &sink->stream);
+		source_frame_bytes = audio_stream_frame_bytes(&source->stream);
+		source = buffer_release(source);
+
+		bytes_to_process = frames * source_frame_bytes;
+
+		buffer_stream_invalidate(source, bytes_to_process);
+		input_buffers[i].data = rballoc(0, SOF_MEM_CAPS_RAM, bytes_to_process);
+		if (!input_buffers[i].data) {
+			comp_err(mod->dev, "codec_adapter_copy(): Failed to alloc input buffer data");
+			ret = -ENOMEM;
+			goto free;
+		}
+
+		input_buffers[i].size = bytes_to_process;
+		ca_copy_from_source_to_module(&source->stream, input_buffers[i].data,
+					      input_buffers[i].size, bytes_to_process);
+		i++;
+	}
+
+	/*
+	 * allocate memory for output buffers. The memory for output buffer data should be
+	 * allocated by the module depending on the number of output samples produced
+	 */
+	output_buffers = rzalloc(SOF_MEM_ZONE_RUNTIME, 0, SOF_MEM_CAPS_RAM,
+				 sizeof(*output_buffers) * mod->num_output_buffers);
+	if (!output_buffers) {
+		comp_err(dev, "codec_adapter_copy(): failed to allocate output buffers");
+		goto free;
+	}
+
+	/*
+	 * This should be removed once all codec implementations start using the passed
+	 * input/output buffers
+	 */
+	source = list_first_item(&dev->bsource_list, struct comp_buffer, sink_list);
+	bytes_to_process = cl.frames * cl.source_frame_bytes;
 
 	/* Proceed only if we have enough data to fill the lib buffer
 	 * completely. If you don't fill whole buffer
@@ -336,12 +408,13 @@ int codec_adapter_copy(struct comp_dev *dev)
 
 	if (!md->mpd.init_done) {
 		buffer_stream_invalidate(source, codec_buff_size);
-		codec_adapter_copy_from_source_to_lib(&source->stream, &md->mpd,
-						      codec_buff_size);
+		ca_copy_from_source_to_module(&source->stream, md->mpd.in_buff,
+					      md->mpd.in_buff_size, codec_buff_size);
 		md->mpd.avail = codec_buff_size;
-		ret = module_process(dev);
+		ret = module_process(mod, input_buffers, mod->num_input_buffers,
+				     output_buffers, mod->num_output_buffers);
 		if (ret)
-			return ret;
+			goto out_free;
 
 		bytes_to_process -= md->mpd.consumed;
 		processed += md->mpd.consumed;
@@ -351,10 +424,11 @@ int codec_adapter_copy(struct comp_dev *dev)
 	}
 
 	buffer_stream_invalidate(source, codec_buff_size);
-	codec_adapter_copy_from_source_to_lib(&source->stream, &md->mpd,
-					      codec_buff_size);
+	ca_copy_from_source_to_module(&source->stream, md->mpd.in_buff,
+				      md->mpd.in_buff_size, codec_buff_size);
 	md->mpd.avail = codec_buff_size;
-	ret = module_process(dev);
+	ret = module_process(mod, input_buffers, mod->num_input_buffers,
+			     output_buffers, mod->num_output_buffers);
 	if (ret) {
 		if (ret == -ENOSPC) {
 			ret = 0;
@@ -370,8 +444,7 @@ int codec_adapter_copy(struct comp_dev *dev)
 			 ret);
 		goto db_verify;
 	}
-	codec_adapter_copy_from_lib_to_sink(&md->mpd, &local_buff->stream,
-					    md->mpd.produced);
+	ca_copy_from_module_to_sink(&local_buff->stream, md->mpd.out_buff, md->mpd.produced);
 
 	bytes_to_process -= md->mpd.consumed;
 	processed += md->mpd.consumed;
@@ -416,6 +489,18 @@ copy_period:
 end:
 	comp_dbg(dev, "codec_adapter_copy(): processed %d in this call %d bytes left for next period",
 		 processed, bytes_to_process);
+
+out_free:
+	for (i = 0; i < mod->num_output_buffers; i++)
+		rfree(output_buffers[i].data);
+
+	rfree(output_buffers);
+
+free:
+	for (i = 0; i < mod->num_input_buffers; i++)
+		rfree(input_buffers[i].data);
+	rfree(input_buffers);
+
 	return ret;
 }
 
